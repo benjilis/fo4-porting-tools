@@ -24,8 +24,12 @@ from tag_readers.read_animation import read_animation                  # noqa: E
 from tag_readers.read_skeleton import read_skeleton                    # noqa: E402
 from tag_readers.read_rig import read_runtime_rig                      # noqa: E402
 from animation_decoding.decode_animation import decode_animation       # noqa: E402
-from runtime_rig.rig_retarget import rig_retarget                      # noqa: E402
+from runtime_rig.rig_retarget import rig_retarget, calc_control_limit  # noqa: E402
 from animation_export.convert_animation_object_to_local import convert_obj_to_local  # noqa: E402
+from matrix_operations.glm_matrix_operations import glm_decompose_mat4  # noqa: E402
+
+# First weapon control of the first-person rigs (controls 70-73 hold the magazine, handle and grip bones).
+WEAPON_CONTROL_START = 70
 
 for name in ('runtime_rig.rig_retarget', 'animation_export.convert_animation_object_to_local',
              'tag.tag_array'):
@@ -83,6 +87,44 @@ class Rig:
             return False
         return bool(np.mean(turns) > 0.9 and np.mean(offsets) < 0.4 * self.bind_translation_scale())
 
+    def _bind(self, bone):
+        """Bind pose of a bone in parent space: (translation, quaternion xyzw, scale), Tiger axes."""
+        scale, rot, tr = glm_decompose_mat4(self.skeleton.bone_to_parent_offset[bone])
+        return (np.array([tr[0], tr[1], tr[2]], dtype=np.float64),
+                np.array([rot[1], rot[2], rot[3], rot[0]], dtype=np.float64),
+                np.array([scale[0], scale[1], scale[2]], dtype=np.float64))
+
+    def _weapon_offsets_to_bind(self, tracks, limit):
+        """Weapon control tracks that hold offsets from the rest pose (zero at frame 0) get the bind pose added.
+
+        The parser reads a stored translation [a, b, c] as Tiger (b, c, a) and a stored
+        quaternion [a, b, c, d] as Tiger xyzw (b, c, a, d); the same mapping is undone here.
+        """
+        for index in range(WEAPON_CONTROL_START, min(limit, len(tracks), self.rig.control_to_bone.length)):
+            track = tracks[index]
+            if track.translations is None:
+                continue
+            bind_t, bind_q, _ = self._bind(self.rig.control_to_bone[index])
+            first = np.asarray(track.translations, dtype=np.float64).reshape(-1, 3)[0]
+            if np.linalg.norm(bind_t) < 1e-3 or np.linalg.norm(first) > 1e-4:
+                continue
+            offsets = np.asarray(track.translations, dtype=np.float64).reshape(-1, 3)
+            track.translations = (offsets + bind_t[[2, 0, 1]]).astype(np.float32)
+            deltas = (np.asarray(track.rotations, dtype=np.float64).reshape(-1, 4)
+                      if track.rotations is not None else np.array([[0.0, 0.0, 0.0, 1.0]]))
+            # Stored [a, b, c, d] -> Tiger xyzw (b, c, a, d); the result goes back to the stored order (c, a, b, d).
+            turned = _quat_multiply(bind_q, deltas[..., [1, 2, 0, 3]])
+            track.rotations = turned[..., [2, 0, 1, 3]].astype(np.float32)
+
+    def _unsolved_controls_to_bind(self, local, limit):
+        """Bones whose control the clip does not drive stay at their bind pose, not at the origin."""
+        for index in range(limit, self.rig.control_to_bone.length):
+            bone = self.rig.control_to_bone[index]
+            bind_t, bind_q, bind_s = self._bind(bone)
+            local[bone].translations[:] = bind_t
+            local[bone].rotations[:] = bind_q
+            local[bone].scales[:] = bind_s
+
     def decode(self, clip_path, name=None, base=None):
         """Decodes a clip to local bone tracks.
 
@@ -115,9 +157,13 @@ class Rig:
                         track.scales = np.array([first], dtype=np.float32)
                     else:
                         track.scales = (np.asarray(track.scales, dtype=np.float64) * first).astype(np.float32)
+        limit = calc_control_limit(self.rig, data.runtime_rig_components)
+        if not additive:
+            self._weapon_offsets_to_bind(tracks, limit)
         header = data.animation_header
         retargeted = rig_retarget(data, tracks, self.skeleton, self.rig)
         local = convert_obj_to_local(data, retargeted, self.skeleton)
+        self._unsolved_controls_to_bind(local, limit)
         scales = np.stack([t.scales for t in local])
         rotations = np.stack([t.rotations for t in local])
         translations = np.stack([t.translations for t in local])
